@@ -212,7 +212,6 @@ func NewGCPFallback(ctx context.Context, primaryConn grpc.ClientConnInterface, f
 		}
 	}
 
-	// The error rate check belongs to the state and starts at most once per state.
 	state.startRateCheck(fallbackOpts.Period, gcpFallback.rateCheck)
 
 	if fallbackOpts.PrimaryProbingFn != nil {
@@ -359,8 +358,6 @@ func (f *GCPFallback) rateCheck() {
 	}
 
 	if f.enableFallback && primaryErrorRate >= f.errorRateThreshold && primaryFailures >= uint64(f.minFailedCalls) {
-		// Only the caller that made the switch reports it, so that instances
-		// sharing the state do not count it more than once.
 		if f.state.triggerFallback(generation) {
 			f.reportTransition(f.primaryChannelName, f.fallbackChannelName)
 		}

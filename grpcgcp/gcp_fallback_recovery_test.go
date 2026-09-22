@@ -301,7 +301,10 @@ func TestGCPFallbackState_Shared(t *testing.T) {
 		expectUnary(t, fallbackConnB, codes.OK).Times(1)
 		fallbackB.Invoke(context.Background(), "method", nil, nil)
 
-		time.Sleep(8 * time.Second)
+		// Probe progress is pooled, so the two instances together meet
+		// MinPrimaryProbeSuccessCount of 3 with the probes at t=12s and t=15s.
+		// Per-instance progress would need a third round at t=18s.
+		time.Sleep(5 * time.Second)
 		synctest.Wait()
 		wantFallback(t, fallbackA, false, "instance A after successful probes")
 		wantFallback(t, fallbackB, false, "instance B after successful probes")
@@ -336,15 +339,24 @@ func TestGCPFallbackState_SharedSurvivesMemberClose(t *testing.T) {
 }
 
 func TestGCPFallbackState_RateCheckStartsOnce(t *testing.T) {
-	state := NewGCPFallbackState()
-	defer state.Close()
+	synctest.Test(t, func(t *testing.T) {
+		state := NewGCPFallbackState()
+		t.Cleanup(state.Close)
 
-	if !state.startRateCheck(time.Minute, func() {}) {
-		t.Fatal("first startRateCheck() = false, want true")
-	}
-	if state.startRateCheck(time.Minute, func() {}) {
-		t.Error("second startRateCheck() = true, want false")
-	}
+		var first, second atomic.Int64
+		state.startRateCheck(time.Second, func() { first.Add(1) })
+		state.startRateCheck(time.Second, func() { second.Add(1) })
+
+		time.Sleep(3500 * time.Millisecond)
+		synctest.Wait()
+
+		if got := first.Load(); got != 3 {
+			t.Errorf("first check ran %d times, want 3", got)
+		}
+		if got := second.Load(); got != 0 {
+			t.Errorf("second check ran %d times, want 0", got)
+		}
+	})
 }
 
 func TestGCPFallbackState_Generation(t *testing.T) {

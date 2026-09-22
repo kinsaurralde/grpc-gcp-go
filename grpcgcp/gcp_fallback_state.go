@@ -30,20 +30,15 @@ import (
 // fall back and recover together. A GCPFallback creates its own state when
 // none is provided.
 //
-// Both transitions are currently pool-wide. Recovering per instance while
-// falling back together would be an additional option, not a change to this
-// type's public surface.
-//
 // The periodic error rate check runs once per state, using the options of the
 // GCPFallback that attached first. Instances sharing a state should be
 // configured with the same error rate options.
 //
 // All methods are safe for concurrent use.
 type GCPFallbackState struct {
-	// inFallback and generation are written only under mu, always together, but
-	// are read without it: inFallback on the RPC hot path, and generation by
-	// the probes. Every change of one is a change of the other, so an unchanged
-	// generation means the mode did not move.
+	// Written only under mu, always together, but read without it: inFallback
+	// on the RPC hot path and generation by the probes. Since they always
+	// change together, an unchanged generation means the mode did not move.
 	inFallback atomic.Bool
 	generation atomic.Uint64
 
@@ -52,19 +47,18 @@ type GCPFallbackState struct {
 	fallbackSuccesses atomic.Uint64
 	fallbackFailures  atomic.Uint64
 
-	// mu serializes the fallback and recovery transitions and guards the fields
-	// below.
-	mu                sync.Mutex
-	probeSuccesses    uint64
-	firstProbeSuccess time.Time
-	rateCheckStarted  bool
+	// mu serializes the transitions and guards the fields below.
+	mu                       sync.Mutex
+	primaryProbeSuccesses    uint64
+	firstPrimaryProbeSuccess time.Time
+	rateCheckStarted         bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
-// recoveryConfig is the part of GCPFallbackOptions that drives recovery. It is
-// passed per call so that the state holds no per-instance configuration.
+// recoveryConfig is the recovery part of GCPFallbackOptions, passed per call
+// so that the state holds no per-instance configuration.
 type recoveryConfig struct {
 	enabled      bool
 	minSuccesses uint64
@@ -82,9 +76,6 @@ func newGCPFallbackState(parent context.Context) *GCPFallbackState {
 	return &GCPFallbackState{ctx: ctx, cancel: cancel}
 }
 
-// isInFallback reports whether the fallback connection should be used. Kept
-// unexported because per-channel recovery would make this the pool-wide
-// answer rather than any single instance's.
 func (s *GCPFallbackState) isInFallback() bool {
 	return s.inFallback.Load()
 }
@@ -127,9 +118,6 @@ func (s *GCPFallbackState) drainFallback() (successes, failures uint64) {
 // expectedGeneration must be the generation read before the call statistics
 // were collected. A mismatch means a recovery happened while they were being
 // collected, which makes them describe an outage that is already over.
-//
-// The generation is bumped only on a real transition. Bumping it on every call
-// would reset the recovery progress and could prevent recovery entirely.
 func (s *GCPFallbackState) triggerFallback(expectedGeneration uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -166,11 +154,11 @@ func (s *GCPFallbackState) recordPrimaryProbeResult(success bool, expectedGenera
 	}
 
 	now := time.Now()
-	if s.firstProbeSuccess.IsZero() {
-		s.firstProbeSuccess = now
+	if s.firstPrimaryProbeSuccess.IsZero() {
+		s.firstPrimaryProbeSuccess = now
 	}
-	s.probeSuccesses++
-	if s.probeSuccesses < cfg.minSuccesses || now.Sub(s.firstProbeSuccess) < cfg.minDuration {
+	s.primaryProbeSuccesses++
+	if s.primaryProbeSuccesses < cfg.minSuccesses || now.Sub(s.firstPrimaryProbeSuccess) < cfg.minDuration {
 		return false
 	}
 
@@ -185,20 +173,19 @@ func (s *GCPFallbackState) recordPrimaryProbeResult(success bool, expectedGenera
 }
 
 func (s *GCPFallbackState) resetProbeProgressLocked() {
-	s.probeSuccesses = 0
-	s.firstProbeSuccess = time.Time{}
+	s.primaryProbeSuccesses = 0
+	s.firstPrimaryProbeSuccess = time.Time{}
 }
 
 // startRateCheck starts the periodic error rate check unless it is already
-// running, and reports whether this call started it. The check belongs to the
-// state so that it keeps running when one of the instances sharing the state
-// is closed.
-func (s *GCPFallbackState) startRateCheck(period time.Duration, check func()) bool {
+// running. The check belongs to the state so that it keeps running when one of
+// the instances sharing the state is closed.
+func (s *GCPFallbackState) startRateCheck(period time.Duration, check func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.rateCheckStarted {
-		return false
+		return
 	}
 	// Set under the same lock that starts the goroutine, so the flag can never
 	// be set without a running check behind it.
@@ -216,5 +203,4 @@ func (s *GCPFallbackState) startRateCheck(period time.Duration, check func()) bo
 			}
 		}
 	}()
-	return true
 }
