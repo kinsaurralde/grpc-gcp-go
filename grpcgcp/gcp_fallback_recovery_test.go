@@ -1,6 +1,6 @@
 /*
  *
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -62,6 +62,8 @@ func recoveryOpts(probe GCPFallbackProbeFn) *GCPFallbackOptions {
 	opts.PrimaryProbingFn = probe
 	opts.EnableRecovery = true
 	opts.MinPrimaryProbeSuccessCount = 3
+	// Most tests only exercise the count; the duration has its own tests.
+	opts.MinPrimaryProbeSuccessDuration = 0
 	return opts
 }
 
@@ -85,7 +87,7 @@ func wantFallback(t *testing.T, f *GCPFallback, want bool, when string) {
 func TestGCPFallbackRecovery_DisabledByDefault(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		opts := recoveryOpts(probeScript(""))
-		opts.EnableRecovery = false
+		opts.EnableRecovery = NewGCPFallbackOptions().EnableRecovery
 		_, gcpFallback, primaryConn, _ := setup(t, opts)
 
 		failPrimary(t, gcpFallback, primaryConn, 3)
@@ -136,7 +138,7 @@ func TestGCPFallbackRecovery_FullCycle(t *testing.T) {
 		expectUnary(t, fallbackConn, codes.OK).Times(1)
 		gcpFallback.Invoke(context.Background(), "method", nil, nil)
 
-		at(31 * time.Second)
+		at(31 * time.Second) // Probes at t=21s, 24s and 27s.
 		wantFallback(t, gcpFallback, false, "second recovery")
 		expectUnary(t, primaryConn, codes.OK).Times(1)
 		gcpFallback.Invoke(context.Background(), "method", nil, nil)
@@ -146,7 +148,7 @@ func TestGCPFallbackRecovery_FullCycle(t *testing.T) {
 func TestGCPFallbackRecovery_ProbeFailureResetsProgress(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		opts := recoveryOpts(probeScript("", "", "Unavailable", ""))
-		// Probe only after the fallback, to keep the script aligned with it.
+		// A long interval keeps the timeline easy to follow.
 		opts.PrimaryProbingInterval = 30 * time.Second
 		_, gcpFallback, primaryConn, _ := setup(t, opts)
 
@@ -187,7 +189,7 @@ func TestGCPFallbackRecovery_MinDurationBlocksRecovery(t *testing.T) {
 		wantFallback(t, gcpFallback, true, "after rate check")
 
 		// t=40s: the count was met by the probe at t=12s, but the probes have
-		// only been succeeding for 28s.
+		// only been succeeding for 27s.
 		time.Sleep(29 * time.Second)
 		synctest.Wait()
 		wantFallback(t, gcpFallback, true, "duration not met")
@@ -200,8 +202,8 @@ func TestGCPFallbackRecovery_MinDurationBlocksRecovery(t *testing.T) {
 }
 
 // Calls already in flight on the primary when the fallback happens report their
-// failures afterwards. They describe the outage that was just recovered from,
-// so they must not immediately trigger another fallback.
+// failures afterwards. They describe the outage, so they are not counted, and
+// must not trigger another fallback after the recovery.
 func TestGCPFallbackRecovery_NoImmediateRefallback(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		_, gcpFallback, primaryConn, _ := setup(t, recoveryOpts(probeScript("")))
@@ -215,6 +217,9 @@ func TestGCPFallbackRecovery_NoImmediateRefallback(t *testing.T) {
 		// Stragglers from before the fallback.
 		for i := 0; i < 5; i++ {
 			gcpFallback.reportPrimaryStatus(context.Background(), codes.Unavailable)
+		}
+		if successes, failures := gcpFallback.state.drainPrimary(); successes+failures != 0 {
+			t.Errorf("primary counters = %d successes, %d failures in fallback, want 0", successes, failures)
 		}
 
 		time.Sleep(8 * time.Second)
@@ -280,7 +285,7 @@ func TestGCPFallbackRecovery_Metric(t *testing.T) {
 // results are pooled into one decision.
 func TestGCPFallbackState_Shared(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		state := NewGCPFallbackState()
+		state := &GCPFallbackState{} // The zero value is usable.
 		t.Cleanup(state.Close)
 
 		opts := recoveryOpts(probeScript(""))
@@ -338,20 +343,54 @@ func TestGCPFallbackState_SharedSurvivesMemberClose(t *testing.T) {
 	})
 }
 
-func TestGCPFallbackState_RateCheckStartsOnce(t *testing.T) {
+// An instance with fallback disabled must not take the rate check of a shared
+// state, which would disable fallback for every instance sharing it.
+func TestGCPFallbackState_DisabledMemberDoesNotTakeRateCheck(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		state := NewGCPFallbackState()
 		t.Cleanup(state.Close)
 
-		var first, second atomic.Int64
+		opts := NewGCPFallbackOptions()
+		opts.Period = 10 * time.Second
+		opts.ErrorRateThreshold = 0.5
+		opts.MinFailedCalls = 3
+		opts.SharedState = state
+		opts.EnableFallback = false
+		setup(t, opts)
+
+		opts.EnableFallback = true
+		_, fallbackB, primaryB, _ := setup(t, opts)
+
+		failPrimary(t, fallbackB, primaryB, 3)
+
+		time.Sleep(11 * time.Second)
+		synctest.Wait()
+		wantFallback(t, fallbackB, true, "after rate check")
+	})
+}
+
+func TestGCPFallbackState_RateCheckLifecycle(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		state := NewGCPFallbackState()
+
+		var zero, first, second atomic.Int64
+		state.startRateCheck(0, func() { zero.Add(1) }) // Ignored, not a panic.
 		state.startRateCheck(time.Second, func() { first.Add(1) })
 		state.startRateCheck(time.Second, func() { second.Add(1) })
 
 		time.Sleep(3500 * time.Millisecond)
 		synctest.Wait()
+		state.Close()
+		state.Close() // Idempotent.
+		state.startRateCheck(time.Second, func() { second.Add(1) })
 
+		time.Sleep(3 * time.Second)
+		synctest.Wait()
+		if got := zero.Load(); got != 0 {
+			t.Errorf("check with a zero period ran %d times, want 0", got)
+		}
 		if got := first.Load(); got != 3 {
-			t.Errorf("first check ran %d times, want 3", got)
+			t.Errorf("first check ran %d times, want 3 (stopped by Close)", got)
 		}
 		if got := second.Load(); got != 0 {
 			t.Errorf("second check ran %d times, want 0", got)
@@ -421,6 +460,7 @@ func TestGCPFallbackRecovery_ConcurrentRPCs(t *testing.T) {
 	opts.PrimaryProbingFn = probeScript("")
 	opts.EnableRecovery = true
 	opts.MinPrimaryProbeSuccessCount = 1
+	opts.MinPrimaryProbeSuccessDuration = 0
 
 	gcpFallback, err := NewGCPFallback(context.Background(), primaryConn, fallbackConn, opts)
 	if err != nil {
@@ -467,4 +507,47 @@ func TestNewGCPFallback_RejectsInvalidRecoveryOptions(t *testing.T) {
 			}
 		})
 	}
+}
+
+// With a shared state, one round of probes over enough instances meets
+// MinPrimaryProbeSuccessCount. The default MinPrimaryProbeSuccessDuration keeps
+// that from recovering the pool before the primary has been healthy a while.
+func TestGCPFallbackState_SharedRecoveryNeedsDefaultDuration(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		state := NewGCPFallbackState()
+		t.Cleanup(state.Close)
+
+		opts := recoveryOpts(probeScript(""))
+		opts.SharedState = state
+		opts.MinPrimaryProbeSuccessCount = 2
+		opts.MinPrimaryProbeSuccessDuration = NewGCPFallbackOptions().MinPrimaryProbeSuccessDuration
+
+		_, fallbackA, primaryA, _ := setup(t, opts)
+		setup(t, opts)
+
+		failPrimary(t, fallbackA, primaryA, 3)
+
+		// Rate check at t=10s, then both instances probe at t=12s.
+		time.Sleep(13 * time.Second)
+		synctest.Wait()
+		wantFallback(t, fallbackA, true, "one round of probes")
+
+		// t=193s: the probes at t=192s are 3m after the first success.
+		time.Sleep(180 * time.Second)
+		synctest.Wait()
+		wantFallback(t, fallbackA, false, "default duration met")
+	})
+}
+
+// Cancelling the context of a GCPFallback closes the state it owns.
+// synctest fails the test if the rate check goroutine leaks.
+func TestGCPFallbackState_OwnedStopsWithContext(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		if _, err := NewGCPFallback(ctx, mocks.NewMockClientConnInterface(ctrl), mocks.NewMockClientConnInterface(ctrl), NewGCPFallbackOptions()); err != nil {
+			t.Fatalf("NewGCPFallback() error = %v", err)
+		}
+		cancel()
+	})
 }

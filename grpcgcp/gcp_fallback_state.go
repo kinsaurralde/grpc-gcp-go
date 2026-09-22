@@ -1,6 +1,6 @@
 /*
  *
- * Copyright 2025 gRPC authors.
+ * Copyright 2026 gRPC authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@
 package grpcgcp
 
 import (
-	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,14 +30,13 @@ import (
 // none is provided.
 //
 // The periodic error rate check runs once per state, using the options of the
-// GCPFallback that attached first. Instances sharing a state should be
-// configured with the same error rate options.
-//
-// All methods are safe for concurrent use.
+// first GCPFallback with fallback enabled to use it. Instances sharing a state
+// should be configured with the same error rate options.
 type GCPFallbackState struct {
 	// Written only under mu, always together, but read without it: inFallback
-	// on the RPC hot path and generation by the probes. Since they always
-	// change together, an unchanged generation means the mode did not move.
+	// on the RPC hot path and generation by the probes and the rate check.
+	// Since they always change together, an unchanged generation means the
+	// mode did not move.
 	inFallback atomic.Bool
 	generation atomic.Uint64
 
@@ -52,9 +50,9 @@ type GCPFallbackState struct {
 	primaryProbeSuccesses    uint64
 	firstPrimaryProbeSuccess time.Time
 	rateCheckStarted         bool
+	closed                   bool
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	done chan struct{}
 }
 
 // recoveryConfig is the recovery part of GCPFallbackOptions, passed per call
@@ -68,12 +66,7 @@ type recoveryConfig struct {
 // NewGCPFallbackState creates a state to share between GCPFallback instances
 // through GCPFallbackOptions.SharedState. The caller must close it.
 func NewGCPFallbackState() *GCPFallbackState {
-	return newGCPFallbackState(context.Background())
-}
-
-func newGCPFallbackState(parent context.Context) *GCPFallbackState {
-	ctx, cancel := context.WithCancel(parent)
-	return &GCPFallbackState{ctx: ctx, cancel: cancel}
+	return &GCPFallbackState{}
 }
 
 func (s *GCPFallbackState) isInFallback() bool {
@@ -83,7 +76,21 @@ func (s *GCPFallbackState) isInFallback() bool {
 // Close stops the periodic error rate check. It does not close any connection
 // and does not stop the probing of the GCPFallback instances using this state.
 func (s *GCPFallbackState) Close() {
-	s.cancel()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return
+	}
+	s.closed = true
+	close(s.doneLocked())
+}
+
+func (s *GCPFallbackState) doneLocked() chan struct{} {
+	if s.done == nil {
+		s.done = make(chan struct{})
+	}
+	return s.done
 }
 
 func (s *GCPFallbackState) recordPrimary(failure bool) {
@@ -107,13 +114,12 @@ func (s *GCPFallbackState) drainPrimary() (successes, failures uint64) {
 	return s.primarySuccesses.Swap(0), s.primaryFailures.Swap(0)
 }
 
-// drainFallback reads and resets the fallback counters.
 func (s *GCPFallbackState) drainFallback() (successes, failures uint64) {
 	return s.fallbackSuccesses.Swap(0), s.fallbackFailures.Swap(0)
 }
 
-// triggerFallback switches to the fallback connection and reports whether this
-// call made the switch, so that only one caller reports the transition.
+// triggerFallback switches to fallback mode and reports whether this call
+// made the switch, so that only one caller reports the transition.
 //
 // expectedGeneration must be the generation read before the call statistics
 // were collected. A mismatch means a recovery happened while they were being
@@ -132,11 +138,11 @@ func (s *GCPFallbackState) triggerFallback(expectedGeneration uint64) bool {
 }
 
 // recordPrimaryProbeResult feeds a primary probe result into the recovery
-// decision and reports whether it switched back to the primary connection.
+// decision and reports whether it switched back to primary mode.
 //
-// expectedGeneration must be the generation read before the probe ran. A
-// mismatch means the mode changed while the probe was in flight, so the result
-// no longer applies.
+// expectedGeneration is the generation read before the probe ran. If the state
+// recovered and fell back again while the probe was in flight, the probe
+// predates the current outage and its result is ignored.
 func (s *GCPFallbackState) recordPrimaryProbeResult(success bool, expectedGeneration uint64, cfg recoveryConfig) bool {
 	if !cfg.enabled {
 		return false
@@ -162,8 +168,8 @@ func (s *GCPFallbackState) recordPrimaryProbeResult(success bool, expectedGenera
 		return false
 	}
 
-	// Drop the current error rate window. It was filled during the outage and
-	// would otherwise trigger a fallback again on the next check.
+	// Drop results recorded by calls that raced with the fallback, so the next
+	// error rate window starts empty.
 	s.primarySuccesses.Store(0)
 	s.primaryFailures.Store(0)
 	s.resetProbeProgressLocked()
@@ -177,26 +183,26 @@ func (s *GCPFallbackState) resetProbeProgressLocked() {
 	s.firstPrimaryProbeSuccess = time.Time{}
 }
 
-// startRateCheck starts the periodic error rate check unless it is already
-// running. The check belongs to the state so that it keeps running when one of
-// the instances sharing the state is closed.
+// startRateCheck starts the periodic error rate check until Close, unless it is
+// already running, the state is closed or period is not positive. The check
+// belongs to the state so that it keeps running when one of the instances
+// sharing the state is closed.
 func (s *GCPFallbackState) startRateCheck(period time.Duration, check func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.rateCheckStarted {
+	if s.rateCheckStarted || s.closed || period <= 0 {
 		return
 	}
-	// Set under the same lock that starts the goroutine, so the flag can never
-	// be set without a running check behind it.
 	s.rateCheckStarted = true
+	done := s.doneLocked()
 
 	go func() {
 		ticker := time.NewTicker(period)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-s.ctx.Done():
+			case <-done:
 				return
 			case <-ticker.C:
 				check()

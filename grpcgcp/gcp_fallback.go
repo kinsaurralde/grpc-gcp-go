@@ -116,6 +116,7 @@ type GCPFallbackOptions struct {
 	EnableRecovery bool
 	// MinPrimaryProbeSuccessCount is the number of consecutive successful
 	// primary probes required for recovery. A probe failure resets the count.
+	// With a shared state, the probes of all the instances count towards it.
 	MinPrimaryProbeSuccessCount int
 	// MinPrimaryProbeSuccessDuration is how long the primary probes must have
 	// been succeeding without interruption for recovery. Zero means no
@@ -144,8 +145,9 @@ func NewGCPFallbackOptions() *GCPFallbackOptions {
 		PrimaryChannelName:      "primary",
 		FallbackChannelName:     "fallback",
 
-		EnableRecovery:              false,
-		MinPrimaryProbeSuccessCount: 10,
+		EnableRecovery:                 false,
+		MinPrimaryProbeSuccessCount:    10,
+		MinPrimaryProbeSuccessDuration: 3 * time.Minute,
 	}
 }
 
@@ -175,9 +177,9 @@ func NewGCPFallback(ctx context.Context, primaryConn grpc.ClientConnInterface, f
 
 	state := fallbackOpts.SharedState
 	if state == nil {
-		// Derived from the fallback context so that closing this GCPFallback
-		// also closes the state it created.
-		state = newGCPFallbackState(fallbackCtx)
+		// Closing this GCPFallback, or cancelling ctx, closes the state it owns.
+		state = NewGCPFallbackState()
+		context.AfterFunc(fallbackCtx, state.Close)
 	}
 
 	gcpFallback := &GCPFallback{
@@ -212,7 +214,9 @@ func NewGCPFallback(ctx context.Context, primaryConn grpc.ClientConnInterface, f
 		}
 	}
 
-	state.startRateCheck(fallbackOpts.Period, gcpFallback.rateCheck)
+	if fallbackOpts.EnableFallback {
+		state.startRateCheck(fallbackOpts.Period, gcpFallback.rateCheck)
+	}
 
 	if fallbackOpts.PrimaryProbingFn != nil {
 		go func() {
@@ -339,8 +343,7 @@ func (f *GCPFallback) rateCheck() {
 	primaryErrorRate := float32(0)
 	fallbackErrorRate := float32(0)
 
-	// Read before collecting the statistics below, so that a recovery landing
-	// in the middle of this check cannot be undone by counts that predate it.
+	// Read before draining so that a concurrent recovery invalidates these counts.
 	generation := f.state.generation.Load()
 
 	primarySuccesses, primaryFailures := f.state.drainPrimary()
@@ -389,8 +392,7 @@ func (f *GCPFallback) probePrimary() {
 		return
 	}
 
-	// Read before probing so that the result can be discarded if the fallback
-	// mode changes while the probe is in flight.
+	// Read before probing so that a concurrent transition invalidates the result.
 	generation := f.state.generation.Load()
 
 	result := f.primaryProbingFn(f.primaryConn)
@@ -423,7 +425,7 @@ func (f *GCPFallback) probeFallback() {
 	}
 }
 
-// Close stops all the background goroutines and releases resources.
+// Close stops the background goroutines of this instance and releases resources.
 // Another way to close GCPFallback is to cancel the provided context.
 // But both ways do not close the underlying connections.
 // The caller must close the primary and the fallback ClientConn on their own.
@@ -465,7 +467,9 @@ func (f *GCPFallback) addToCallCounter(ctx context.Context, channelName, status 
 }
 
 func (f *GCPFallback) reportPrimaryStatus(ctx context.Context, code codes.Code) {
-	f.state.recordPrimary(f.isFailure(code))
+	if !f.state.isInFallback() {
+		f.state.recordPrimary(f.isFailure(code))
+	}
 	f.addToCallCounter(ctx, f.primaryChannelName, code.String())
 }
 
