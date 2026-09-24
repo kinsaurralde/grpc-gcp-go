@@ -110,22 +110,10 @@ type GCPFallbackOptions struct {
 	// FallbackChannelName is the name of the fallback channel.
 	FallbackChannelName string
 
-	// EnableRecovery allows successful primary probes to switch back from the
-	// fallback connection to the primary one. It requires PrimaryProbingFn.
-	// Disabled by default, making a fallback permanent.
-	EnableRecovery bool
-	// MinPrimaryProbeSuccessCount is the number of consecutive successful
-	// primary probes required for recovery. A probe failure resets the count.
-	// With a shared state, the probes of all the instances count towards it.
-	MinPrimaryProbeSuccessCount int
-	// MinPrimaryProbeSuccessDuration is how long the primary probes must have
-	// been succeeding without interruption for recovery. Zero means no
-	// duration requirement.
+	EnableRecovery                 bool
+	MinPrimaryProbeSuccessCount    int
 	MinPrimaryProbeSuccessDuration time.Duration
 
-	// SharedState makes multiple GCPFallback instances fall back and recover
-	// together. A shared state is not closed by GCPFallback.Close. When nil, a
-	// state is created for this instance only.
 	SharedState *GCPFallbackState
 
 	// MeterProvider is the OpenTelemetry meter provider.
