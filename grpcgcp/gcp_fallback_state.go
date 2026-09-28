@@ -33,10 +33,7 @@ import (
 // first GCPFallback with fallback enabled to use it. Instances sharing a state
 // should be configured with the same error rate options.
 type GCPFallbackState struct {
-	// Written only under mu, always together, but read without it: inFallback
-	// on the RPC hot path and generation by the probes and the rate check.
-	// Since they always change together, an unchanged generation means the
-	// mode did not move.
+	// Updated together under mu; read lock-free. generation increments on every mode change.
 	inFallback atomic.Bool
 	generation atomic.Uint64
 
@@ -118,12 +115,8 @@ func (s *GCPFallbackState) drainFallback() (successes, failures uint64) {
 	return s.fallbackSuccesses.Swap(0), s.fallbackFailures.Swap(0)
 }
 
-// triggerFallback switches to fallback mode and reports whether this call
-// made the switch, so that only one caller reports the transition.
-//
-// expectedGeneration must be the generation read before the call statistics
-// were collected. A mismatch means a recovery happened while they were being
-// collected, which makes them describe an outage that is already over.
+// triggerFallback switches to fallback mode if generation still matches
+// expectedGeneration, and reports whether the switch happened.
 func (s *GCPFallbackState) triggerFallback(expectedGeneration uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -137,12 +130,9 @@ func (s *GCPFallbackState) triggerFallback(expectedGeneration uint64) bool {
 	return true
 }
 
-// recordPrimaryProbeResult feeds a primary probe result into the recovery
-// decision and reports whether it switched back to primary mode.
-//
-// expectedGeneration is the generation read before the probe ran. If the state
-// recovered and fell back again while the probe was in flight, the probe
-// predates the current outage and its result is ignored.
+// recordPrimaryProbeResult records a primary probe result and reports whether
+// it recovered to primary mode. Stale probes (generation != expectedGeneration)
+// are ignored.
 func (s *GCPFallbackState) recordPrimaryProbeResult(success bool, expectedGeneration uint64, cfg recoveryConfig) bool {
 	if !cfg.enabled {
 		return false
@@ -183,10 +173,8 @@ func (s *GCPFallbackState) resetProbeProgressLocked() {
 	s.firstPrimaryProbeSuccess = time.Time{}
 }
 
-// startRateCheck starts the periodic error rate check until Close, unless it is
-// already running, the state is closed or period is not positive. The check
-// belongs to the state so that it keeps running when one of the instances
-// sharing the state is closed.
+// startRateCheck runs check every period until Close. Only the first call per
+// state takes effect.
 func (s *GCPFallbackState) startRateCheck(period time.Duration, check func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

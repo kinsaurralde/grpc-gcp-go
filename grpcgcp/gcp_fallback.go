@@ -355,8 +355,8 @@ func (f *GCPFallback) rateCheck() {
 	}
 
 	if f.errorRatioGauge != nil {
-		f.errorRatioGauge.Record(f.ctx, float64(primaryErrorRate), metric.WithAttributes(attribute.String("channel_name", f.primaryChannelName)))
-		f.errorRatioGauge.Record(f.ctx, float64(fallbackErrorRate), metric.WithAttributes(attribute.String("channel_name", f.fallbackChannelName)))
+		f.errorRatioGauge.Record(context.Background(), float64(primaryErrorRate), metric.WithAttributes(attribute.String("channel_name", f.primaryChannelName)))
+		f.errorRatioGauge.Record(context.Background(), float64(fallbackErrorRate), metric.WithAttributes(attribute.String("channel_name", f.fallbackChannelName)))
 	}
 }
 
@@ -366,7 +366,7 @@ func (f *GCPFallback) reportTransition(fromChannelName, toChannelName string) {
 		return
 	}
 	f.fallbackCounter.Add(
-		f.ctx,
+		context.Background(),
 		1,
 		metric.WithAttributes(
 			attribute.String("from_channel_name", fromChannelName),
@@ -377,6 +377,7 @@ func (f *GCPFallback) reportTransition(fromChannelName, toChannelName string) {
 
 func (f *GCPFallback) probePrimary() {
 	if !f.state.isInFallback() {
+		f.primaryDownSince.Store(nil)
 		return
 	}
 
